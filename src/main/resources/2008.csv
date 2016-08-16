@@ -1,0 +1,314 @@
+package sample.stream
+
+import java.text.SimpleDateFormat
+import java.util.Date
+
+import akka._
+import akka.http.scaladsl.Http
+import akka.http.scaladsl.marshalling.Marshal
+import akka.http.scaladsl.model.HttpMethods._
+import akka.http.scaladsl.model.{RequestEntity, HttpResponse, HttpRequest, FormData}
+import akka.stream.scaladsl._
+import com.mysql.jdbc.JDBC4Connection
+import com.typesafe.config.ConfigFactory
+import com.redis._
+import sample.stream.service.{JHTTP, SyncDB, AlchemyWebService}
+import akka.actor.{Actor, Props, ActorSystem}
+import akka.stream._
+import scala.concurrent._
+import scala.concurrent.duration.Duration
+import scala.util.{Failure, Success}
+import scala.concurrent.ExecutionContext.Implicits._
+
+import akka.util.{ByteString, Timeout}
+
+import akka.http.scaladsl.model.HttpMethods._
+import akka.http.scaladsl.model._
+
+object utils {
+
+
+  implicit val system = ActorSystem("Sys")
+  implicit val materializer = ActorMaterializer()
+
+  val mysqlUrl = ConfigFactory.load().getString("mydb.url")
+  val mysqlUser = ConfigFactory.load().getString("mydb.user")
+  val mysqlPass = ConfigFactory.load().getString("mydb.password")
+
+  val lines: Iterator[String] = scala.io.Source.fromFile("src/main/resources/2008.csv", "utf-8").getLines()
+  val wordList: Iterator[List[String]] = lines.map(line => line.replace(",", " ").split("\\s+").toList)
+  val words = wordList.reduceLeft((a, b) => a ++ b)
+
+  val host = ConfigFactory.load().getString("redis.host")
+  val port = ConfigFactory.load().getString("redis.port")
+
+  val redis = new RedisClientPool(host, port.toInt)
+  val redisClient = new RedisClient(host, port.toInt)
+
+  val DELAY_COMPENSATION = 2000
+  val TEST_ERROR_CASE = false
+
+  var db: SyncDB = null
+
+  val startTime = currentTime
+
+  def _redis = {
+    //new RedisClient(host, port.toInt)
+  }
+
+  def currentTime = {
+
+    val date = new java.util.Date()
+    date.getTime()
+
+  }
+
+  def connect = {
+
+    db = new SyncDB(mysqlUrl, mysqlUser, mysqlPass)
+    db
+
+  }
+
+  def recoverySetAll(words: List[String]) = {
+
+    redis.withClient {
+      client => {
+        for (word <- words) {
+          client.set(word, "0")
+        }
+      }
+    }
+
+  }
+
+  def recoverySet(word: String, value: String) = {
+
+    redis.withClient {
+      client => {
+        client.set(word, value)
+      }
+    }
+
+
+  }
+
+
+  def recoveryGet(word: String) = {
+
+    /*
+    val redisTransaction = redis.transaction() // new TransactionBuilder
+    redisTransaction.watch(word)
+    redisTransaction.get(word)
+    redisTransaction.exec()
+    */
+
+
+  }
+
+  def syncRedisSet(word: String, count: String) = {
+    redisClient.set(word, count)
+  }
+
+}
+
+/**
+ * To be fairly compare two different way, one is reactive stream, another is not,
+ * as we know, currently database is at local server, and API is at remove server,
+ * so there is some connection time difference between them, when initialize the
+ * conneciton to remote API, it will take more time than local connection
+ *
+ * Here used an actor to do db, and in current thread use Future to do reacitve
+ * stream, which is async, then for the same word in the list, try to do the same:
+ *
+ * - connection to the server
+ * - send text to it
+ * - get result
+ *
+ */
+object Main {
+
+  val ALCHEMY_URL = "access.alchemyapi.com"
+  //calls/text/TextGetTextSentiment"
+  val API_KEY = "af5335e69195d6109ee74908a2abe61c1267d97d"
+
+  //implicit val timeout = Timeout(Duration("5 seconds"))
+
+  //import system.dispatcher
+
+  def main(args: Array[String]): Unit = {
+
+
+    utils.recoverySetAll(utils.words)
+
+    //system.terminate()
+
+    // change the value of utils.TEST_ERROR_CASE to true to test recovery
+    // or else, to test success situation
+
+    //val lines: Iterator[String] = scala.io.Source.fromFile("src/main/resources/2008.csv", "utf-8").getLines()
+    val wordList: Iterator[List[String]] = scala.io.Source.fromFile("src/main/resources/2008.csv", "utf-8").getLines().map(line => line.replace(",", " ").split("\\s+").toList)
+    val sourceAPI = Source.fromIterator(() => wordList).mapConcat(identity)
+
+    val wordList2 = scala.io.Source.fromFile("src/main/resources/2008.csv", "utf-8").getLines().map(line => line.replace(",", " ").split("\\s+").toList)
+    val sourceDb = Source.fromIterator(() => wordList2).mapConcat(identity)
+
+    val connectionFlow: Flow[HttpRequest, HttpResponse, Future[Http.OutgoingConnection]] =
+      Http().outgoingConnection(ALCHEMY_URL)
+
+    val startTime = utils.startTime
+
+
+    println("=" * 10 + "testing now" + "=" * 10)
+    val api = sourceAPI.map {
+      word =>
+        println("API ==> " + word)
+
+        // here we will save its result as initialzed zero
+
+        utils.recoverySet(word, "0")
+
+        val data = ByteString("outputMode=json&text=" + word + "&apikey=" + API_KEY)
+        HttpRequest(POST, uri = "/calls/text/TextGetTextSentiment", entity = data)
+
+    }.via(connectionFlow)/*.map {
+
+      //res => res.withEntity(HttpEntity(ContentTypes.`text/html(UTF-8)`, "<html><body>Hello world!</body></html>"))
+
+
+    }*/.runWith(Sink.foreach {
+      res => res.status.isSuccess() match {
+        case true =>
+
+          println("==> send ok")
+          //utils.recoverySet(word, "1")
+          //println(res.entity)
+        case _ =>
+          println("==> send error")
+      }
+
+        //val completeTime = utils.currentTime
+        //println(utils.currentTime)
+    })
+
+
+    val flowSyncHTTP = Flow[String].map {
+      word =>
+
+        println("API SYNC ==> " + word)
+        JHTTP.post("http://access.alchemyapi.com/calls/text/TextGetTextSentiment", "outputMode=json&text=" + word + "&apikey=" + API_KEY)
+    }
+
+    val apiSync = sourceDb.via(flowSyncHTTP).runWith(Sink.foreach {
+      res =>
+        //println(res)
+        println("API sync -- send ok")
+      //val completeTime = utils.currentTime
+      //println(utils.currentTime)
+    })
+
+    api.onComplete {
+
+      case Success(r) =>
+        println(r)
+
+        val apiTimeTotal = (utils.currentTime - startTime)
+        println("API Stream Used time total = " + apiTimeTotal + "ms")
+
+
+        apiSync.onComplete {
+          case Success(r) =>
+
+            val dbTimeTotal = (utils.currentTime - startTime)
+            println("API SYNC: Used time total = " + dbTimeTotal + "ms")
+            println("Difference API SYNC - API Stream = " + (dbTimeTotal - apiTimeTotal) + "ms")
+          case _ =>
+
+            println("DB compare error")
+        }
+
+      case _ =>
+        println("error")
+    }
+
+
+
+
+    //recovery
+    //compareTwo
+
+  }
+
+
+  def compareTwo = {
+
+    //utils.startTime
+
+    //println(utils.startTime)
+
+  }
+
+  def recovery = {
+
+    Future {
+
+      var i = 0
+
+      while (true) {
+
+        // get the result of word, check if it's ok
+
+        utils.redis.withClient {
+          client => {
+
+            for (word <- utils.words) {
+
+              val c = client.get(word).getOrElse("0")
+              val count = c.toInt - 1
+
+              //println(utils.startTime + ":" + utils.currentTime)
+
+              if (count >= 1) {
+
+                val range = Range(1, count)
+                var time = 0
+
+                for (a <- range) {
+                  time += a * 10
+                }
+
+                //print(time + "\r")
+
+                if ((time * 1000 + utils.startTime) <= utils.currentTime) {
+
+                  i = 0
+
+                  println("Trying to resend it after " + 10 * count + "sec")
+                  client.set(word, (count + 2) + "")
+                  //actorApi ! SendMessage(word, (count + 2) + "")
+
+                }
+              }
+
+            }
+
+            i = i + 1
+            print(i + " sec\r")
+            Thread.sleep(1000)
+
+          }
+
+
+        }
+
+      }
+
+    }
+
+  }
+
+
+}
+
+
+
